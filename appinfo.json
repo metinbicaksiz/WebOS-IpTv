@@ -1,0 +1,16 @@
+{
+  "id": "com.metinbicaksiz.iptvplayer",
+  "version": "1.0.0",
+  "vendor": "metinbicaksiz",
+  "type": "web",
+  "main": "index.html",
+  "title": "IPTV Player",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "bgColor": "#111827",
+  "resolution": "1920x1080",
+  "iconColor": "#111827",
+  "disableBackHistoryAPI": true,
+  "supportsAudioGuidance": false,
+  "requiredACG": []
+}

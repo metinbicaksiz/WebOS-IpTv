@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>IPTV Player</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<section id="screen-login" class="screen active">
+  <div class="login-box">
+    <h1>IPTV Player</h1>
+    <label>Server URL</label>
+    <input id="login-url" type="text" placeholder="http://server.example.com:8080" autocomplete="off">
+    <label>Username</label>
+    <input id="login-user" type="text" placeholder="username" autocomplete="off">
+    <label>Password</label>
+    <input id="login-pass" type="password" placeholder="password" autocomplete="off">
+    <button id="login-btn" class="focusable">Sign in</button>
+    <p id="login-error" class="error"></p>
+    <p id="login-status" class="status"></p>
+  </div>
+</section>
+
+<!-- MAIN MENU SCREEN -->
+<section id="screen-menu" class="screen">
+  <div id="menu-header">
+    <div id="menu-title">IPTV Player</div>
+    <button id="menu-logout-btn" class="focusable">Logout</button>
+  </div>
+  <div id="menu-tiles">
+    <div class="menu-tile tile-live focusable" data-target="live" tabindex="0">
+      <div class="tile-icon">&#128250;</div>
+      <div class="tile-label">Live TV</div>
+    </div>
+    <div class="menu-tile tile-movies focusable" data-target="movies" tabindex="0">
+      <div class="tile-icon">&#127916;</div>
+      <div class="tile-label">Movies</div>
+    </div>
+    <div class="menu-tile tile-series focusable" data-target="series" tabindex="0">
+      <div class="tile-icon">&#127909;</div>
+      <div class="tile-label">Series</div>
+    </div>
+    <div class="menu-tile tile-favorites focusable" data-target="favorites" tabindex="0">
+      <div class="tile-icon">&#9733;</div>
+      <div class="tile-label">Favorites</div>
+    </div>
+    <div class="menu-tile tile-search focusable" data-target="search" tabindex="0">
+      <div class="tile-icon">&#128269;</div>
+      <div class="tile-label">Search</div>
+    </div>
+  </div>
+</section>
+
+<!-- BROWSE SCREEN (categories | items | preview) -->
+<section id="screen-home" class="screen">
+  <div id="browse-header">
+    <button id="browse-back" class="focusable">&larr; Menu</button>
+    <div id="browse-title"></div>
+    <input id="search-input" type="text" placeholder="Search...">
+  </div>
+
+  <div id="home-body">
+    <aside id="category-list"></aside>
+    <div id="item-list"></div>
+    <div id="preview-panel">
+      <div id="preview-video-wrap">
+        <img id="preview-poster" alt="">
+      </div>
+      <div id="preview-empty">Select a channel to preview it here</div>
+      <div id="preview-info">
+        <div id="preview-name"></div>
+        <div id="preview-status"></div>
+        <button id="preview-fav-btn" class="focusable">&#9825; Favorite</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SERIES DETAIL SCREEN -->
+<section id="screen-series" class="screen">
+  <button id="series-back" class="focusable back-btn">&larr; Back</button>
+  <h2 id="series-title"></h2>
+  <div id="series-body">
+    <aside id="season-list"></aside>
+    <div id="episode-list"></div>
+  </div>
+</section>
+
+<!-- PLAYER SCREEN (fullscreen; the shared <video> element is moved here) -->
+<section id="screen-player" class="screen">
+  <div id="player-overlay">
+    <div id="player-title"></div>
+    <div id="player-status"></div>
+  </div>
+</section>
+
+<!-- Parking spot for the single shared <video> element when it isn't
+     being shown as a preview or fullscreen (e.g. browsing movies/series) -->
+<div id="video-home"></div>
+
+<script src="js/keys.js"></script>
+<script src="js/xtream.js"></script>
+<script src="js/nav.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

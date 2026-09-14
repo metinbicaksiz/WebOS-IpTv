@@ -20,11 +20,12 @@ Movies, and Series directly from your TV's remote.
 - **Live preview** — focus a channel for a moment and it starts playing in the small
   preview box automatically. The preview is intentionally *debounced* (~1.2s) so
   quickly scrolling through a list doesn't fire off a new stream connection per row.
-- **Seamless fullscreen handoff** — pressing OK on a channel that's already loaded in
-  the preview jumps to fullscreen without reconnecting; going back returns it to the
-  small preview the same way. This works by moving the single shared `<video>`
-  element around the DOM rather than recreating it, since browsers don't interrupt
-  playback when a video element is relocated.
+- **Fullscreen playback** — pressing OK on a channel starts a fresh connection sized
+  for fullscreen from the start, using the browser's native Fullscreen API on the
+  preview video element. (webOS renders live video through a hardware overlay plane
+  that only reliably shows a picture when playback is promoted to fullscreen through
+  that native API — resizing an already-playing video via CSS left the audio playing
+  but the picture black, so the video element is never moved or resized manually.)
 - **Series support** — browse series by category, drill into seasons and episodes.
 - **Favorites** — mark channels/movies/series as favorites (via the remote's green
   key, or the Favorite button in the preview panel) and access them from their own
@@ -52,10 +53,12 @@ Movies, and Series directly from your TV's remote.
   list, preview panel, series seasons/episodes).
 - **`js/app.js`** — the main app controller: screens, login, favorites (localStorage),
   category/item rendering, the debounced live preview, the shared video element and
-  its seamless preview ↔ fullscreen handoff, and playback retry logic.
+  its native-Fullscreen-API playback, and playback retry logic.
 - **`js/keys.js`** — webOS/LG remote key code constants.
-- **`index.html` / `css/style.css`** — the screens (login, main menu, browse,
-  series detail, fullscreen player) and their TV-sized styling.
+- **`index.html` / `css/style.css`** — the screens (login, main menu, browse, series
+  detail) and their TV-sized styling. There's no separate "player screen" — the video
+  element lives inside the browse screen's preview panel at all times, and fullscreen
+  is achieved by calling `requestFullscreen()` on that same element.
 
 No external libraries are used — playback relies on webOS's native HLS support in
 the `<video>` element.

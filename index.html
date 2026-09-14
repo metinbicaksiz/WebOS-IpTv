@@ -67,6 +67,15 @@
     <div id="preview-panel">
       <div id="preview-video-wrap">
         <img id="preview-poster" alt="">
+        <!-- Lives inside the same element that gets requestFullscreen()'d
+             (see js/app.js) so it renders on top of the video in fullscreen
+             too — the Fullscreen API only promotes one element (and its
+             descendants) into the top layer, so the overlay has to be a
+             descendant of that element, not a sibling elsewhere in the DOM. -->
+        <div id="player-overlay">
+          <div id="player-title"></div>
+          <div id="player-status"></div>
+        </div>
       </div>
       <div id="preview-empty">Select a channel to preview it here</div>
       <div id="preview-info">
@@ -87,18 +96,6 @@
     <div id="episode-list"></div>
   </div>
 </section>
-
-<!-- PLAYER SCREEN (fullscreen; the shared <video> element is moved here) -->
-<section id="screen-player" class="screen">
-  <div id="player-overlay">
-    <div id="player-title"></div>
-    <div id="player-status"></div>
-  </div>
-</section>
-
-<!-- Parking spot for the single shared <video> element when it isn't
-     being shown as a preview or fullscreen (e.g. browsing movies/series) -->
-<div id="video-home"></div>
 
 <script src="js/keys.js"></script>
 <script src="js/xtream.js"></script>

@@ -274,7 +274,6 @@ input:focus { outline: none; border-color: #3b82f6; }
   padding: 20px;
 }
 #preview-empty.active { display: flex; }
-#video-home { display: none; }
 #preview-info {
   display: none;
   flex-direction: column;
@@ -337,7 +336,20 @@ input:focus { outline: none; border-color: #3b82f6; }
 }
 
 /* ---------- Player ---------- */
-#screen-player { position: relative; background: #000; }
+/* Fullscreen is the browser's native Fullscreen API on #preview-video-wrap,
+   not a manual CSS trick — webOS's hardware video overlay only reliably
+   shows a picture when the video is promoted via the platform's own
+   fullscreen mechanism. The video element itself never moves in the DOM
+   (see js/app.js for why), and the overlay lives inside the same wrap so it
+   stays part of the fullscreen element (the Fullscreen API only promotes
+   one element and its descendants into the top layer). */
+#preview-video-wrap:fullscreen,
+#preview-video-wrap:-webkit-full-screen {
+  width: 100vw;
+  height: 100vh;
+  aspect-ratio: unset;
+  border-radius: 0;
+}
 #video {
   width: 100%;
   height: 100%;

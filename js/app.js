@@ -15,8 +15,7 @@
       login: document.getElementById('screen-login'),
       menu: document.getElementById('screen-menu'),
       home: document.getElementById('screen-home'),
-      series: document.getElementById('screen-series'),
-      player: document.getElementById('screen-player')
+      series: document.getElementById('screen-series')
     },
     loginUrl: document.getElementById('login-url'),
     loginUser: document.getElementById('login-user'),
@@ -42,20 +41,43 @@
     seriesTitle: document.getElementById('series-title'),
     seasonList: document.getElementById('season-list'),
     episodeList: document.getElementById('episode-list'),
-    videoHome: document.getElementById('video-home'),
     playerOverlay: document.getElementById('player-overlay'),
     playerTitle: document.getElementById('player-title'),
     playerStatus: document.getElementById('player-status')
   };
 
-  // Single shared <video> element. It physically moves between the small
-  // preview box, the fullscreen player, and this offscreen parking spot —
-  // moving a <video> node in the DOM does not interrupt playback, which is
-  // what lets a live preview hand off to fullscreen without reconnecting.
+  // Single shared <video> element, which stays physically parked inside the
+  // small preview box for its entire life. Moving a <video> node between
+  // containers turns out to reset webOS's native playback pipeline even
+  // when .src is never touched (the connection silently drops and a fresh
+  // one has to be renegotiated). "Fullscreen" is instead achieved with the
+  // browser's native Fullscreen API on #preview-video-wrap — webOS's
+  // hardware video overlay only reliably shows a picture when the video is
+  // promoted that way; a manual CSS position:fixed trick left the video
+  // playing (audio worked) but the picture stuck black.
   els.video = document.createElement('video');
   els.video.id = 'video';
   els.video.autoplay = true;
-  els.videoHome.appendChild(els.video);
+  els.previewVideoWrap.appendChild(els.video);
+
+  function isFullscreen() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement);
+  }
+  // Returns the transition promise when the platform provides one, so
+  // callers can wait for fullscreen to actually be established before
+  // starting playback — the hardware video overlay is more likely to bind
+  // to the right geometry if it isn't still promoted mid-transition.
+  function requestFullscreen(el) {
+    var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen || el.msRequestFullscreen;
+    if (!fn) return null;
+    var result = fn.call(el);
+    return (result && result.then) ? result : null;
+  }
+  function exitFullscreenApi() {
+    if (!isFullscreen()) return;
+    var fn = document.exitFullscreen || document.webkitExitFullscreen || document.webkitCancelFullScreen || document.msExitFullscreen;
+    if (fn) fn.call(document);
+  }
 
   var state = {
     currentTab: 'live',
@@ -94,23 +116,6 @@
   function showScreen(name) {
     Object.keys(els.screens).forEach(function (key) {
       els.screens[key].classList.toggle('active', key === name);
-    });
-    setTimeout(function () { Nav.focusFirst(els.screens[name]); }, 30);
-  }
-
-  // Like showScreen, but for transitions that also relocate the shared
-  // <video> element. Some webOS TVs render video through a hardware overlay
-  // tied to the element's layout box; if the video is ever reparented while
-  // its container is display:none (even for one synchronous step), that
-  // overlay can stall/reset and the stream gets stuck buffering even though
-  // playback was fine right before. Making the destination screen visible
-  // first, then moving the video, then hiding the old screen guarantees the
-  // video always has a visible parent throughout the handoff.
-  function showScreenWithVideo(name, moveVideoFn) {
-    els.screens[name].classList.add('active');
-    moveVideoFn();
-    Object.keys(els.screens).forEach(function (key) {
-      if (key !== name) els.screens[key].classList.remove('active');
     });
     setTimeout(function () { Nav.focusFirst(els.screens[name]); }, 30);
   }
@@ -360,8 +365,17 @@
 
     row.addEventListener('click', function () { activateItem(item); });
     row.addEventListener('keydown', function (e) {
-      if (e.keyCode === KEYS.ENTER) activateItem(item);
+      if (e.keyCode === KEYS.ENTER) {
+        // activateItem() can synchronously switch to the fullscreen player
+        // and resume playback. If this same keydown were left to bubble up
+        // to the document-level handler, it would see the player screen as
+        // already active and reinterpret the very same OK press as "toggle
+        // play/pause" — immediately pausing the video it had just resumed.
+        e.stopPropagation();
+        activateItem(item);
+      }
       if (e.keyCode === KEYS.GREEN) {
+        e.stopPropagation();
         toggleFavorite(item);
         rerenderCurrent();
         if (state.previewItem === item) updatePreviewInfo(item);
@@ -500,7 +514,6 @@
   }
 
   function startLivePreview(item) {
-    els.previewVideoWrap.appendChild(els.video);
     state.previewPlaying = item;
     els.video.src = Xtream.liveStreamUrl(item.id);
     els.video.play().catch(function () {});
@@ -508,24 +521,26 @@
 
   function stopPreviewVideo() {
     clearPreviewTimer();
-    if (els.video.parentNode === els.previewVideoWrap) {
+    // Fullscreen owns the video element at this point — don't tear down its
+    // connection just because something in the (hidden) browse screen called
+    // this defensively.
+    if (!isFullscreen()) {
       els.video.pause();
       els.video.removeAttribute('src');
       els.video.load();
-      els.videoHome.appendChild(els.video);
     }
     state.previewPlaying = null;
     els.previewStatus.textContent = '';
   }
 
   els.video.addEventListener('playing', function () {
-    if (els.video.parentNode === els.previewVideoWrap) els.previewStatus.textContent = '';
+    if (!isFullscreen()) els.previewStatus.textContent = '';
   });
   els.video.addEventListener('waiting', function () {
-    if (els.video.parentNode === els.previewVideoWrap) els.previewStatus.textContent = 'Buffering...';
+    if (!isFullscreen()) els.previewStatus.textContent = 'Buffering...';
   });
   els.video.addEventListener('error', function () {
-    if (els.video.parentNode === els.previewVideoWrap && state.previewPlaying) {
+    if (!isFullscreen() && state.previewPlaying) {
       els.previewStatus.textContent = 'Preview unavailable right now.';
     }
   });
@@ -581,7 +596,11 @@
       div.textContent = (ep.episode_num ? ep.episode_num + '. ' : '') + (ep.title || 'Episode');
       div.addEventListener('click', function () { playEpisode(ep); });
       div.addEventListener('keydown', function (e) {
-        if (e.keyCode === KEYS.ENTER) playEpisode(ep);
+        if (e.keyCode === KEYS.ENTER) {
+          // See the item-row ENTER handler for why this must not bubble.
+          e.stopPropagation();
+          playEpisode(ep);
+        }
       });
       els.episodeList.appendChild(div);
     });
@@ -596,38 +615,40 @@
   els.seriesBack.addEventListener('click', function () { showScreen('home'); });
 
   // ---------- Player ----------
+  // webOS renders live video through a hardware overlay plane that only
+  // reliably binds its picture to the element's on-screen size when
+  // playback (re)starts fresh — resizing an already-playing video via CSS
+  // (even a pause/resume nudge without touching .src) leaves the audio
+  // playing but the picture stuck black. So entering fullscreen always goes
+  // through a genuine (re)connect, sized fullscreen from the start, rather
+  // than trying to hand off an already-playing preview in place.
   function playItem(item) {
     state.returnScreen = 'home';
-
-    // If this exact channel is already loaded and playing in the preview,
-    // just move the same <video> element into fullscreen — no src change,
-    // no reconnect, no waiting on the provider's connection limit.
-    if (item.type === 'live' && state.previewPlaying === item &&
-        els.video.parentNode === els.previewVideoWrap && !els.video.error) {
-      enterFullscreenSeamless(item.name);
-      return;
-    }
-
     var url = item.type === 'live' ? Xtream.liveStreamUrl(item.id) : Xtream.vodStreamUrl(item.id, item.ext);
     startPlayback(url, item.name);
   }
 
-  function enterFullscreenSeamless(title) {
-    clearPreviewTimer();
-    clearTimeout(state.retryTimer);
-    state.retryCount = 0;
-    state.playbackUrl = els.video.currentSrc || els.video.src;
-    showScreenWithVideo('player', function () {
-      els.screens.player.insertBefore(els.video, els.playerOverlay);
-    });
-    // Reparenting a <video> element implicitly pauses it in most engines,
-    // even when it stays in the same document — the src/buffer are untouched
-    // so this just resumes playback rather than reconnecting.
-    els.video.play().catch(function () {});
+  function enterFullscreen(title, onReady) {
+    // #preview-video-wrap physically lives inside #screen-home, so that
+    // screen must be the active one (not display:none) for the element to
+    // have a real layout box — requestFullscreen() on a 0x0 element fails
+    // silently. There's no separate "player screen": the Fullscreen API's
+    // own top-layer rendering is what actually covers everything else,
+    // regardless of which screen is nominally active underneath.
+    showScreen('home');
+    // The item row that was pressed keeps DOM focus (entering fullscreen
+    // doesn't move it) and its own keydown handler intercepts ENTER with
+    // stopPropagation(). Left focused, a second ENTER meant to toggle
+    // play/pause while already fullscreen would instead be swallowed by the
+    // row and start yet another fresh connection. Blur it so subsequent key
+    // presses reach this global handler instead.
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    var fsPromise = requestFullscreen(els.previewVideoWrap);
     els.playerTitle.textContent = title || '';
-    els.playerStatus.textContent = '';
     showOverlay();
     scheduleOverlayHide();
+    if (fsPromise) fsPromise.then(onReady, onReady);
+    else if (onReady) onReady();
   }
 
   function startPlayback(url, title) {
@@ -635,14 +656,11 @@
     clearTimeout(state.retryTimer);
     state.playbackUrl = url;
     state.retryCount = 0;
-    showScreenWithVideo('player', function () {
-      els.screens.player.insertBefore(els.video, els.playerOverlay);
-    });
-    els.playerTitle.textContent = title || '';
     els.playerStatus.textContent = 'Loading...';
-    showOverlay();
-    els.video.src = url;
-    els.video.play().catch(function () {});
+    enterFullscreen(title, function () {
+      els.video.src = url;
+      els.video.play().catch(function () {});
+    });
   }
 
   function retryPlayback() {
@@ -669,19 +687,19 @@
   }
 
   els.video.addEventListener('playing', function () {
-    if (els.video.parentNode !== els.screens.player) return;
+    if (!isFullscreen()) return;
     clearTimeout(state.retryTimer);
     state.retryCount = 0;
     els.playerStatus.textContent = '';
     scheduleOverlayHide();
   });
   els.video.addEventListener('waiting', function () {
-    if (els.video.parentNode !== els.screens.player) return;
+    if (!isFullscreen()) return;
     els.playerStatus.textContent = 'Buffering...';
     showOverlay();
   });
   els.video.addEventListener('error', function () {
-    if (els.video.parentNode === els.screens.player && state.playbackUrl) retryPlayback();
+    if (isFullscreen() && state.playbackUrl) retryPlayback();
   });
 
   function showOverlay() {
@@ -698,27 +716,11 @@
   function stopPlayback() {
     clearTimeout(state.retryTimer);
     state.playbackUrl = null;
+    state.retryCount = 0;
+    exitFullscreenApi();
     els.video.pause();
     els.video.removeAttribute('src');
     els.video.load();
-    els.videoHome.appendChild(els.video);
-  }
-
-  // Returning from fullscreen to a channel that's still the one being
-  // previewed just moves the video back into the small preview box instead
-  // of tearing the connection down — you were just watching it, so backing
-  // out shouldn't force a fresh 45-90s reconnect if you look at it again.
-  function exitFullscreenToPreview() {
-    clearTimeout(state.retryTimer);
-    state.playbackUrl = null;
-    state.retryCount = 0;
-    showScreenWithVideo('home', function () {
-      els.previewVideoWrap.appendChild(els.video);
-      els.previewVideoWrap.classList.add('active');
-      els.previewPoster.classList.remove('active');
-    });
-    // Reparenting pauses the video (see enterFullscreenSeamless) — resume it.
-    els.video.play().catch(function () {});
   }
 
   // Release the stream connection as soon as the app is backgrounded or
@@ -726,10 +728,7 @@
   // to just 1) and only free the slot after the client stops requesting
   // segments — leaving a paused/open stream blocks all future playback.
   function releaseIfPlaying() {
-    if (els.video.currentSrc) {
-      stopPlayback();
-      stopPreviewVideo();
-    }
+    if (els.video.currentSrc) stopPlayback();
   }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) releaseIfPlaying();
@@ -741,16 +740,11 @@
   document.addEventListener('keydown', function (e) {
     var code = e.keyCode;
 
-    if (els.screens.player.classList.contains('active')) {
+    if (isFullscreen()) {
       if (code === KEYS.BACK || code === KEYS.BACKSPACE) {
         e.preventDefault();
-        if (state.returnScreen === 'home' && state.previewPlaying &&
-            els.video.currentSrc === Xtream.liveStreamUrl(state.previewPlaying.id) && !els.video.error) {
-          exitFullscreenToPreview();
-        } else {
-          stopPlayback();
-          showScreen(state.returnScreen);
-        }
+        stopPlayback();
+        showScreen(state.returnScreen);
       } else if (code === KEYS.ENTER || code === KEYS.PLAY || code === KEYS.PAUSE) {
         if (els.video.error && state.playbackUrl) {
           clearTimeout(state.retryTimer);

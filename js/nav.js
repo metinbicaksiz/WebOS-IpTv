@@ -124,6 +124,7 @@ var Nav = (function () {
     // ---------- Main menu screen ----------
     if (menuHeader && menuHeader.contains(current)) {
       if (direction === 'down') return focusEl(children(menuTiles)[0]);
+      if (direction === 'left' || direction === 'right') return geometricMove(direction, menuHeader, current);
       return false;
     }
     if (menuTiles && menuTiles.contains(current)) {
@@ -131,7 +132,7 @@ var Nav = (function () {
         return geometricMove(direction, menuTiles, current);
       }
       if (direction === 'up') {
-        return focusEl(closestByX(children(menuHeader), current.getBoundingClientRect().left));
+        return focusEl(closestByX(getFocusables(menuHeader), current.getBoundingClientRect().left));
       }
       return false;
     }

@@ -17,9 +17,18 @@ Movies, and Series directly from your TV's remote.
   remote-friendly tiles.
 - **Category browsing** — a three-column layout: categories on the left, the
   channel/movie/series list in the middle, and a live preview panel on the right.
-- **Live preview** — focus a channel for a moment and it starts playing in the small
-  preview box automatically. The preview is intentionally *debounced* (~1.2s) so
-  quickly scrolling through a list doesn't fire off a new stream connection per row.
+- **Preview on demand** — focusing an item shows its logo and name. Press **OK** on a
+  live channel to play it in the preview box, and **OK** again to go fullscreen. The
+  preview never starts on its own, since an auto-playing preview would take the
+  account's only stream slot just from scrolling. Moving focus to another item or
+  leaving the screen closes it again.
+- **Catalog downloaded once** — each section (Live TV, Movies, Series) is fetched with
+  one request for its categories and one for all of its items, then grouped locally.
+  Switching categories and searching never hit the server. The catalog is saved on
+  the TV for 24 hours; use **Refresh catalog** on the main menu to force a re-download.
+- **One API request at a time** — every `player_api.php` call goes through a single
+  queue, so the app never has two requests open to the provider at once; identical
+  requests share one response.
 - **Fullscreen playback** — pressing OK on a channel starts a fresh connection sized
   for fullscreen from the start, using the browser's native Fullscreen API on the
   preview video element. (webOS renders live video through a hardware overlay plane
@@ -31,11 +40,16 @@ Movies, and Series directly from your TV's remote.
   key, or the Favorite button in the preview panel) and access them from their own
   menu tile.
 - **Search** — search across live TV, movies, and series at once.
-- **Automatic reconnect with backoff** — many Xtream providers allow only one
-  simultaneous connection and take anywhere from a few seconds up to ~90 seconds to
-  release a stream slot after you stop watching. If a new stream is rejected because
-  of this, the app automatically retries with increasing backoff (showing ordinary
-  "Buffering..." for the first few attempts) instead of just failing.
+- **MPEG-TS live streams** — like the desktop IPTV Stream Player, live channels are
+  requested as `.ts`: a single continuous connection that the provider releases the
+  moment it's closed, so switching channels doesn't hit the one-connection limit.
+  (HLS `.m3u8` fetches segments repeatedly, so the provider can only expire the
+  session by timeout, often minutes later.) If the TV can't play TS, the app falls
+  back to HLS automatically and remembers that.
+- **No half-open connections** — a stream that hasn't started after 12 seconds is
+  closed (so it can't hold the slot itself) and retried with backoff.
+- **Releases the stream promptly** — the stream is torn down on Back, when the app is
+  backgrounded/closed, and if fullscreen is exited by any other means.
 - **Remote/d-pad navigation** — focus movement between categories, lists, the preview
   panel, and menu tiles is handled with explicit directional zone rules (not naive
   geometric nearest-neighbor), so arrow-key navigation behaves predictably.
@@ -47,13 +61,14 @@ Movies, and Series directly from your TV's remote.
 
 - **`js/xtream.js`** — a minimal client for the Xtream Codes `player_api.php`
   endpoints (`get_live_categories`, `get_live_streams`, `get_vod_*`, `get_series_*`)
-  and the stream URL formats for live/movie/series playback.
+  and the stream URL formats for live/movie/series playback. All requests are
+  serialized through one queue.
 - **`js/nav.js`** — spatial/zone-based focus navigation for the TV remote's arrow
   keys, aware of each screen's specific layout (menu tiles, category list, item
   list, preview panel, series seasons/episodes).
 - **`js/app.js`** — the main app controller: screens, login, favorites (localStorage),
-  category/item rendering, the debounced live preview, the shared video element and
-  its native-Fullscreen-API playback, and playback retry logic.
+  the cached catalog, category/item rendering, the on-demand preview, the shared video element and
+  its native-Fullscreen-API playback, TS/HLS selection, and playback retry logic.
 - **`js/keys.js`** — webOS/LG remote key code constants.
 - **`index.html` / `css/style.css`** — the screens (login, main menu, browse, series
   detail) and their TV-sized styling. There's no separate "player screen" — the video
@@ -128,5 +143,5 @@ Many Xtream Codes IPTV plans allow only **one active connection at a time**. If 
 see repeated "Connection busy, retrying…" messages, it usually means either another
 device/app is currently streaming on the same account, or the provider hasn't yet
 released your previous session (this can take up to ~90 seconds on some providers).
-The app retries automatically in this situation — no action is needed beyond waiting
-a moment.
+Because live channels are streamed as MPEG-TS, the app's own previous stream is
+released as soon as you switch, so this usually means another device is streaming.

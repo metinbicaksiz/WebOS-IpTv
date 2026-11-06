@@ -24,6 +24,7 @@
     loginError: document.getElementById('login-error'),
     loginStatus: document.getElementById('login-status'),
     menuLogoutBtn: document.getElementById('menu-logout-btn'),
+    menuRefreshBtn: document.getElementById('menu-refresh-btn'),
     menuTiles: document.querySelectorAll('.menu-tile'),
     browseBack: document.getElementById('browse-back'),
     browseTitle: document.getElementById('browse-title'),
@@ -82,11 +83,8 @@
   var state = {
     currentTab: 'live',
     currentCategoryId: null,
-    cache: {
-      live: { categories: null, streamsByCategory: {}, all: null },
-      movies: { categories: null, streamsByCategory: {}, all: null },
-      series: { categories: null, seriesByCategory: {}, all: null }
-    },
+    cache: emptyCache(),
+    seriesInfo: {},
     favorites: [],
     currentSeries: null,
     returnScreen: 'menu',
@@ -94,23 +92,36 @@
     playbackUrl: null,
     retryCount: 0,
     retryTimer: null,
-    previewTimer: null,
     previewItem: null,
-    previewPlaying: null
+    previewPlaying: null,
+    // Bumped on every start/stop so a slot-wait or retry left over from a
+    // previous stream can never open a second connection.
+    playbackToken: 0,
+    stallTimer: null,
+    liveFormat: 'ts'
   };
+  try { state.liveFormat = localStorage.getItem(STORAGE_LIVE_FORMAT) || 'ts'; } catch (e) {}
 
-  // Providers commonly cap simultaneous connections (often to just 1) and
-  // only release a slot ~45-90s after the client stops requesting data,
-  // regardless of how promptly the app tears down its side. Switching
-  // channels right after closing the previous one reliably hits this
-  // window, so retry with backoff instead of failing immediately.
-  var RETRY_DELAYS_MS = [4000, 8000, 12000, 16000, 20000, 20000, 20000, 20000];
+  // Live channels play as MPEG-TS, like the desktop IPTV Stream Player: one
+  // continuous connection that the provider releases the moment it's
+  // closed, so switching channels doesn't run into the one-connection
+  // limit. HLS is only used if this TV turns out not to play TS.
+  var STORAGE_LIVE_FORMAT = 'iptv_live_format';
 
-  // Live preview only starts after focus rests on a channel for a moment —
-  // browsing quickly through a list must not fire off a new stream
-  // connection per row, or the account's single-connection limit would
-  // make the list itself unusable.
-  var PREVIEW_DEBOUNCE_MS = 1200;
+  // If a new stream is still rejected (e.g. another device is using the
+  // account), retry with backoff instead of failing immediately.
+  var RETRY_DELAYS_MS = [3000, 5000, 8000, 12000, 16000, 20000];
+
+  // A provider that's out of slots often just holds the request open
+  // without answering. Give up on such a connection quickly so it can't
+  // occupy the slot itself, then retry.
+  var STALL_TIMEOUT_MS = 12000;
+
+  // Like the desktop IPTV Stream Player, the catalog is downloaded once
+  // (one request per list, not one per category) and reused across
+  // launches until it's refreshed from the main menu.
+  var STORAGE_CATALOG = 'iptv_catalog_';
+  var CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
   // ---------- Screen management ----------
   function showScreen(name) {
@@ -171,16 +182,27 @@
     doLogin(els.loginUrl.value, els.loginUser.value, els.loginPass.value, false);
   });
 
+  // Each tab's catalog: categories plus every item grouped by category_id,
+  // so switching categories or searching never touches the network.
+  function emptyCache() {
+    return { live: null, movies: null, series: null };
+  }
+
   function resetCache() {
-    state.cache = {
-      live: { categories: null, streamsByCategory: {}, all: null },
-      movies: { categories: null, streamsByCategory: {}, all: null },
-      series: { categories: null, seriesByCategory: {}, all: null }
-    };
+    state.cache = emptyCache();
+    state.seriesInfo = {};
+  }
+
+  function clearStoredCatalogs() {
+    ['live', 'movies', 'series'].forEach(function (tab) {
+      try { localStorage.removeItem(STORAGE_CATALOG + tab); } catch (e) {}
+    });
   }
 
   function doLogout() {
-    stopPreviewVideo();
+    stopPlayback();
+    resetCache();
+    clearStoredCatalogs();
     localStorage.removeItem(STORAGE_CREDS);
     els.loginUrl.value = '';
     els.loginUser.value = '';
@@ -188,6 +210,12 @@
     showScreen('login');
   }
   els.menuLogoutBtn.addEventListener('click', doLogout);
+  els.menuRefreshBtn.addEventListener('click', function () {
+    resetCache();
+    clearStoredCatalogs();
+    els.menuRefreshBtn.textContent = 'Catalog cleared — reloads on open';
+    setTimeout(function () { els.menuRefreshBtn.textContent = 'Refresh catalog'; }, 3000);
+  });
 
   // ---------- Main menu ----------
   els.menuTiles.forEach(function (tile) {
@@ -203,7 +231,7 @@
   }
 
   els.browseBack.addEventListener('click', function () {
-    stopPreviewVideo();
+    stopPreview();
     showScreen('menu');
   });
 
@@ -235,30 +263,88 @@
     els.itemList.firstChild.textContent = msg;
   }
 
+  // ---------- Catalog (downloaded once, then cached) ----------
+  var CATALOG_FETCHERS = {
+    live: { type: 'live', categories: function () { return Xtream.getLiveCategories(); }, items: function () { return Xtream.getLiveStreams(); } },
+    movies: { type: 'movie', categories: function () { return Xtream.getVodCategories(); }, items: function () { return Xtream.getVodStreams(); } },
+    series: { type: 'series', categories: function () { return Xtream.getSeriesCategories(); }, items: function () { return Xtream.getSeries(); } }
+  };
+  var catalogLoads = {};
+
+  function catalogOwner() {
+    var creds = loadCreds() || {};
+    return (creds.url || '') + '|' + (creds.user || '');
+  }
+
+  function readStoredCatalog(tab) {
+    try {
+      var stored = JSON.parse(localStorage.getItem(STORAGE_CATALOG + tab));
+      if (stored && stored.owner === catalogOwner() && Date.now() - stored.savedAt < CATALOG_MAX_AGE_MS) {
+        return stored.catalog;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function writeStoredCatalog(tab, catalog) {
+    // Large provider lists can exceed the TV's storage quota; the catalog
+    // then simply lives in memory for this session.
+    try {
+      localStorage.setItem(STORAGE_CATALOG + tab, JSON.stringify({
+        owner: catalogOwner(), savedAt: Date.now(), catalog: catalog
+      }));
+    } catch (e) {
+      try { localStorage.removeItem(STORAGE_CATALOG + tab); } catch (e2) {}
+    }
+  }
+
+  function loadCatalog(tab) {
+    if (state.cache[tab]) return Promise.resolve(state.cache[tab]);
+    var stored = readStoredCatalog(tab);
+    if (stored) {
+      state.cache[tab] = stored;
+      return Promise.resolve(stored);
+    }
+    if (catalogLoads[tab]) return catalogLoads[tab];
+    var f = CATALOG_FETCHERS[tab];
+    var categories;
+    // Requests run one after another (Xtream queues them anyway).
+    catalogLoads[tab] = f.categories().then(function (cats) {
+      categories = (cats || []).map(function (c) {
+        return { category_id: c.category_id, category_name: c.category_name };
+      });
+      return f.items();
+    }).then(function (rawItems) {
+      var byCategory = {};
+      var all = (rawItems || []).map(function (raw) {
+        var item = normalizeItem(raw, f.type);
+        var key = String(raw.category_id);
+        (byCategory[key] = byCategory[key] || []).push(item);
+        return item;
+      });
+      var catalog = { categories: categories, byCategory: byCategory, all: all };
+      state.cache[tab] = catalog;
+      writeStoredCatalog(tab, catalog);
+      return catalog;
+    });
+    var clear = function () { delete catalogLoads[tab]; };
+    catalogLoads[tab].then(clear, clear);
+    return catalogLoads[tab];
+  }
+
   // ---------- Categories ----------
   function loadCategories(tabName) {
-    var bucket = state.cache[tabName];
-    var promise;
-    if (bucket.categories) {
-      promise = Promise.resolve(bucket.categories);
-    } else if (tabName === 'live') {
-      promise = Xtream.getLiveCategories();
-    } else if (tabName === 'movies') {
-      promise = Xtream.getVodCategories();
-    } else {
-      promise = Xtream.getSeriesCategories();
-    }
-    renderMessage('Loading...');
-    promise.then(function (cats) {
-      bucket.categories = cats || [];
-      renderCategories(bucket.categories);
-      if (bucket.categories.length) {
-        selectCategory(tabName, bucket.categories[0].category_id, bucket.categories[0].category_name);
+    renderMessage('Loading ' + (TAB_LABELS[tabName] || '').toLowerCase() + '...');
+    loadCatalog(tabName).then(function (catalog) {
+      if (state.currentTab !== tabName) return;
+      renderCategories(catalog.categories);
+      if (catalog.categories.length) {
+        selectCategory(tabName, catalog.categories[0].category_id, catalog.categories[0].category_name);
       } else {
         renderMessage('No categories found.');
       }
     }).catch(function (err) {
-      renderMessage('Failed to load: ' + err.message);
+      if (state.currentTab === tabName) renderMessage('Failed to load: ' + err.message);
     });
   }
 
@@ -285,33 +371,16 @@
   }
 
   function selectCategory(tabName, categoryId, categoryName) {
+    var catalog = state.cache[tabName];
+    if (!catalog) return;
     state.currentCategoryId = categoryId;
     markActiveCategory(categoryId);
-    els.browseTitle.textContent = (TAB_LABELS[tabName] || '') + (categoryName ? ' | ' + categoryName : '');
-    var bucket = state.cache[tabName];
-    renderMessage('Loading...');
-
-    if (tabName === 'live') {
-      getOrFetch(bucket.streamsByCategory, categoryId, function () { return Xtream.getLiveStreams(categoryId); })
-        .then(function (items) { renderItems(items, 'live'); })
-        .catch(function (err) { renderMessage('Failed to load: ' + err.message); });
-    } else if (tabName === 'movies') {
-      getOrFetch(bucket.streamsByCategory, categoryId, function () { return Xtream.getVodStreams(categoryId); })
-        .then(function (items) { renderItems(items, 'movie'); })
-        .catch(function (err) { renderMessage('Failed to load: ' + err.message); });
-    } else {
-      getOrFetch(bucket.seriesByCategory, categoryId, function () { return Xtream.getSeries(categoryId); })
-        .then(function (items) { renderItems(items, 'series'); })
-        .catch(function (err) { renderMessage('Failed to load: ' + err.message); });
+    if (categoryName === undefined) {
+      var cat = catalog.categories.filter(function (c) { return String(c.category_id) === String(categoryId); })[0];
+      categoryName = cat && cat.category_name;
     }
-  }
-
-  function getOrFetch(cacheObj, key, fetchFn) {
-    if (cacheObj[key]) return Promise.resolve(cacheObj[key]);
-    return fetchFn().then(function (data) {
-      cacheObj[key] = data || [];
-      return cacheObj[key];
-    });
+    els.browseTitle.textContent = (TAB_LABELS[tabName] || '') + (categoryName ? ' | ' + categoryName : '');
+    renderItems(catalog.byCategory[String(categoryId)] || []);
   }
 
   // ---------- Items list ----------
@@ -325,14 +394,13 @@
     return { type: 'series', id: raw.series_id, name: raw.name, icon: raw.cover };
   }
 
-  function renderItems(rawList, type) {
+  function renderItems(items) {
     els.itemList.innerHTML = '';
-    if (!rawList || !rawList.length) {
+    if (!items || !items.length) {
       renderMessage('No items in this category.');
       return;
     }
-    rawList.forEach(function (raw) {
-      var item = normalizeItem(raw, type);
+    items.forEach(function (item) {
       els.itemList.appendChild(buildItemRow(item));
     });
   }
@@ -392,6 +460,10 @@
   function activateItem(item) {
     if (item.type === 'series') {
       openSeries(item);
+    } else if (item.type === 'live' && !isPreviewing(item)) {
+      // First OK plays the channel in the preview box; a second OK on the
+      // same channel goes fullscreen.
+      startPreview(item);
     } else {
       playItem(item);
     }
@@ -412,33 +484,19 @@
 
   // ---------- Search ----------
   function preloadAllForSearch() {
-    var jobs = [];
-    if (!state.cache.live.all) {
-      jobs.push(Xtream.getLiveStreams().then(function (d) {
-        state.cache.live.all = (d || []).map(function (r) { return normalizeItem(r, 'live'); });
-      }).catch(function () { state.cache.live.all = []; }));
-    }
-    if (!state.cache.movies.all) {
-      jobs.push(Xtream.getVodStreams().then(function (d) {
-        state.cache.movies.all = (d || []).map(function (r) { return normalizeItem(r, 'movie'); });
-      }).catch(function () { state.cache.movies.all = []; }));
-    }
-    if (!state.cache.series.all) {
-      jobs.push(Xtream.getSeries().then(function (d) {
-        state.cache.series.all = (d || []).map(function (r) { return normalizeItem(r, 'series'); });
-      }).catch(function () { state.cache.series.all = []; }));
-    }
-    Promise.all(jobs).then(function () {
-      if (state.currentTab === 'search' && els.searchInput.value.trim() === '') {
-        renderMessage('Type to search across live TV, movies and series.');
-      }
-    });
+    // Sequential, and each list is only ever downloaded once.
+    loadCatalog('live').catch(function () {})
+      .then(function () { return loadCatalog('movies').catch(function () {}); })
+      .then(function () { return loadCatalog('series').catch(function () {}); })
+      .then(function () {
+        if (state.currentTab === 'search') runSearch(els.searchInput.value);
+      });
   }
 
   function runSearch(query) {
     query = query.trim().toLowerCase();
     if (!query) { renderMessage('Type to search across live TV, movies and series.'); return; }
-    var pools = [state.cache.live.all, state.cache.movies.all, state.cache.series.all];
+    var pools = ['live', 'movies', 'series'].map(function (tab) { return state.cache[tab] && state.cache[tab].all; });
     var results = [];
     pools.forEach(function (pool) {
       if (!pool) return;
@@ -456,11 +514,9 @@
   els.searchInput.addEventListener('input', function () { runSearch(els.searchInput.value); });
 
   // ---------- Preview panel ----------
-  function clearPreviewTimer() {
-    clearTimeout(state.previewTimer);
-    state.previewTimer = null;
-  }
-
+  // The preview never starts on its own: on a single-connection account an
+  // auto-playing preview would grab the only slot just from scrolling. It
+  // plays only after OK, and moving focus away releases it again.
   function updatePreviewInfo(item) {
     els.previewInfo.classList.add('active');
     els.previewName.textContent = item.name;
@@ -470,80 +526,51 @@
   }
 
   function renderPreviewEmpty() {
-    clearPreviewTimer();
-    stopPreviewVideo();
+    stopPreview();
     els.previewVideoWrap.classList.remove('active');
     els.previewPoster.classList.remove('active');
     els.previewInfo.classList.remove('active');
     els.previewEmpty.classList.add('active');
+    els.previewStatus.textContent = '';
     state.previewItem = null;
   }
 
-  function renderPreviewPoster(item) {
-    clearPreviewTimer();
-    stopPreviewVideo();
+  function focusPreview(item) {
+    if (state.previewPlaying && !isPreviewing(item)) stopPreview();
     els.previewEmpty.classList.remove('active');
     els.previewVideoWrap.classList.add('active');
     els.previewPoster.classList.add('active');
     els.previewPoster.style.visibility = '';
     els.previewPoster.src = item.icon || '';
     els.previewPoster.onerror = function () { els.previewPoster.style.visibility = 'hidden'; };
+    els.previewStatus.textContent = item.type === 'series' ? 'Press OK to open'
+      : item.type === 'live' ? 'Press OK to preview' : 'Press OK to watch';
     state.previewItem = item;
     updatePreviewInfo(item);
   }
 
-  function focusPreview(item) {
-    clearPreviewTimer();
-    if (item.type !== 'live') {
-      renderPreviewPoster(item);
-      return;
-    }
-    // Release any playing preview immediately so the provider's slow
-    // connection-release timer starts as soon as possible, but only
-    // *start* the new one after focus settles on this channel.
-    if (state.previewPlaying) stopPreviewVideo();
-    els.previewEmpty.classList.remove('active');
-    els.previewPoster.classList.remove('active');
-    // Show the (empty, black) preview box right away so the layout doesn't
-    // jump when the debounce timer finishes and the video actually appears.
-    els.previewVideoWrap.classList.add('active');
-    els.previewStatus.textContent = 'Loading preview...';
-    state.previewItem = item;
-    updatePreviewInfo(item);
-    state.previewTimer = setTimeout(function () { startLivePreview(item); }, PREVIEW_DEBOUNCE_MS);
+  // Compared by id: favorites/search rows hold their own copies of an item.
+  function isPreviewing(item) {
+    var p = state.previewPlaying;
+    return !!p && p.type === item.type && String(p.id) === String(item.id);
   }
 
-  function startLivePreview(item) {
+  function startPreview(item) {
+    closeStream();
+    var token = ++state.playbackToken;
+    state.playbackUrl = Xtream.liveStreamUrl(item.id, state.liveFormat);
     state.previewPlaying = item;
-    els.video.src = Xtream.liveStreamUrl(item.id);
-    els.video.play().catch(function () {});
+    state.retryCount = 0;
+    els.previewPoster.classList.remove('active');
+    els.previewStatus.textContent = 'Loading preview...';
+    openStream(token);
   }
 
-  function stopPreviewVideo() {
-    clearPreviewTimer();
-    // Fullscreen owns the video element at this point — don't tear down its
-    // connection just because something in the (hidden) browse screen called
-    // this defensively.
-    if (!isFullscreen()) {
-      els.video.pause();
-      els.video.removeAttribute('src');
-      els.video.load();
-    }
-    state.previewPlaying = null;
-    els.previewStatus.textContent = '';
+  function stopPreview() {
+    if (!state.previewPlaying || isFullscreen()) return;
+    stopPlayback();
+    els.previewPoster.classList.add('active');
   }
-
-  els.video.addEventListener('playing', function () {
-    if (!isFullscreen()) els.previewStatus.textContent = '';
-  });
-  els.video.addEventListener('waiting', function () {
-    if (!isFullscreen()) els.previewStatus.textContent = 'Buffering...';
-  });
-  els.video.addEventListener('error', function () {
-    if (!isFullscreen() && state.previewPlaying) {
-      els.previewStatus.textContent = 'Preview unavailable right now.';
-    }
-  });
 
   els.previewFavBtn.addEventListener('click', function () {
     if (!state.previewItem) return;
@@ -557,13 +584,20 @@
 
   // ---------- Series detail ----------
   function openSeries(item) {
-    stopPreviewVideo();
+    stopPreview();
     state.currentSeries = item;
     els.seriesTitle.textContent = item.name;
     els.seasonList.innerHTML = '';
     els.episodeList.innerHTML = '';
     showScreen('series');
-    Xtream.getSeriesInfo(item.id).then(function (data) {
+    var infoPromise = state.seriesInfo[item.id]
+      ? Promise.resolve(state.seriesInfo[item.id])
+      : Xtream.getSeriesInfo(item.id).then(function (data) {
+        state.seriesInfo[item.id] = data;
+        return data;
+      });
+    infoPromise.then(function (data) {
+      if (state.currentSeries !== item) return;
       var episodesBySeason = (data && data.episodes) || {};
       var seasonNums = Object.keys(episodesBySeason).sort(function (a, b) { return Number(a) - Number(b); });
       if (!seasonNums.length) {
@@ -624,7 +658,7 @@
   // than trying to hand off an already-playing preview in place.
   function playItem(item) {
     state.returnScreen = 'home';
-    var url = item.type === 'live' ? Xtream.liveStreamUrl(item.id) : Xtream.vodStreamUrl(item.id, item.ext);
+    var url = item.type === 'live' ? Xtream.liveStreamUrl(item.id, state.liveFormat) : Xtream.vodStreamUrl(item.id, item.ext);
     startPlayback(url, item.name);
   }
 
@@ -651,55 +685,123 @@
     else if (onReady) onReady();
   }
 
-  function startPlayback(url, title) {
-    stopPreviewVideo();
+  // Status line for whichever view owns the stream right now.
+  function setStreamStatus(text) {
+    if (isFullscreen()) {
+      els.playerStatus.textContent = text;
+      showOverlay();
+    } else {
+      els.previewStatus.textContent = text;
+    }
+  }
+
+  // Connects right away, as the desktop player does — with TS the previous
+  // stream's slot is already free once closeStream() has run.
+  function openStream(token) {
+    if (token !== state.playbackToken) return;
+    clearTimeout(state.stallTimer);
+    els.video.src = state.playbackUrl;
+    els.video.play().catch(function () {});
+    state.stallTimer = setTimeout(function () {
+      if (token === state.playbackToken) streamFailed(false);
+    }, STALL_TIMEOUT_MS);
+  }
+
+  function streamFailed(unsupported) {
+    // This TV can't play TS: switch live playback to HLS for good.
+    if (unsupported && /\.ts$/.test(state.playbackUrl || '') && state.liveFormat === 'ts') {
+      state.liveFormat = 'm3u8';
+      try { localStorage.setItem(STORAGE_LIVE_FORMAT, 'm3u8'); } catch (e) {}
+      state.playbackUrl = state.playbackUrl.replace(/\.ts$/, '.m3u8');
+      closeStream();
+      openStream(state.playbackToken);
+      return;
+    }
+    if (isFullscreen() && state.playbackUrl) {
+      retryPlayback();
+    } else if (state.previewPlaying) {
+      // No automatic retries for a preview — release the slot and let the
+      // user decide with OK.
+      stopPlayback();
+      els.previewPoster.classList.add('active');
+      els.previewStatus.textContent = 'Preview unavailable. Press OK to try again.';
+    }
+  }
+
+  // Tears down the current stream, if any, so its slot starts being
+  // released right away. Exactly one stream URL is ever assigned at a time.
+  function closeStream() {
     clearTimeout(state.retryTimer);
+    clearTimeout(state.stallTimer);
+    els.video.pause();
+    els.video.removeAttribute('src');
+    els.video.load();
+  }
+
+  function startPlayback(url, title) {
+    // Pressing OK again on what's already starting/playing must not open
+    // another connection.
+    if (state.playbackUrl === url && isFullscreen()) return;
+    // Fullscreen needs a fresh connection (see above), so the preview's
+    // stream is closed first and the slot wait covers its release.
+    closeStream();
+    state.previewPlaying = null;
+    var token = ++state.playbackToken;
     state.playbackUrl = url;
     state.retryCount = 0;
     els.playerStatus.textContent = 'Loading...';
     enterFullscreen(title, function () {
-      els.video.src = url;
-      els.video.play().catch(function () {});
+      if (token === state.playbackToken) openStream(token);
     });
   }
 
   function retryPlayback() {
+    closeStream();
     if (state.retryCount >= RETRY_DELAYS_MS.length) {
       els.playerStatus.textContent = 'Playback error. Your account allows only one connection ' +
         'at a time — make sure nothing else is using it, then press OK to retry.';
       showOverlay();
       return;
     }
+    var token = state.playbackToken;
     var delay = RETRY_DELAYS_MS[state.retryCount];
     state.retryCount++;
     // Keep the first few retries looking like ordinary buffering — most of
     // the time the connection frees up quickly, and surfacing "connection
     // busy" language only once it's taking a while avoids alarming the user
     // over what is usually just a brief reconnect.
-    els.playerStatus.textContent = state.retryCount <= 3
-      ? 'Buffering...'
-      : 'Still reconnecting… your account allows only one connection at a time.';
+    els.playerStatus.textContent = state.retryCount <= 2
+      ? 'Connecting...'
+      : 'Still connecting… another device may be using your account\'s only connection.';
     showOverlay();
     state.retryTimer = setTimeout(function () {
-      els.video.src = state.playbackUrl;
-      els.video.play().catch(function () {});
+      if (token === state.playbackToken) openStream(token);
     }, delay);
   }
 
   els.video.addEventListener('playing', function () {
-    if (!isFullscreen()) return;
+    clearTimeout(state.stallTimer);
+    if (!isFullscreen()) {
+      if (state.previewPlaying) els.previewStatus.textContent = 'Press OK for fullscreen';
+      return;
+    }
     clearTimeout(state.retryTimer);
     state.retryCount = 0;
     els.playerStatus.textContent = '';
     scheduleOverlayHide();
   });
   els.video.addEventListener('waiting', function () {
-    if (!isFullscreen()) return;
+    if (!isFullscreen()) {
+      if (state.previewPlaying) els.previewStatus.textContent = 'Buffering...';
+      return;
+    }
     els.playerStatus.textContent = 'Buffering...';
     showOverlay();
   });
   els.video.addEventListener('error', function () {
-    if (isFullscreen() && state.playbackUrl) retryPlayback();
+    // Ignore errors from the empty src that closeStream() leaves behind.
+    if (!els.video.getAttribute('src')) return;
+    streamFailed(els.video.error && els.video.error.code === 4);
   });
 
   function showOverlay() {
@@ -714,21 +816,32 @@
   }
 
   function stopPlayback() {
-    clearTimeout(state.retryTimer);
+    state.playbackToken++;
     state.playbackUrl = null;
+    state.previewPlaying = null;
     state.retryCount = 0;
+    closeStream();
+    els.playerOverlay.classList.remove('visible');
     exitFullscreenApi();
-    els.video.pause();
-    els.video.removeAttribute('src');
-    els.video.load();
   }
+
+  // If fullscreen is left any way other than BACK (e.g. the system takes it
+  // away), the stream would otherwise keep its slot playing out of sight.
+  function onFullscreenChange() {
+    if (!isFullscreen() && state.playbackUrl) {
+      stopPlayback();
+      showScreen(state.returnScreen);
+    }
+  }
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', onFullscreenChange);
 
   // Release the stream connection as soon as the app is backgrounded or
   // closed, since most Xtream providers cap simultaneous connections (often
   // to just 1) and only free the slot after the client stops requesting
   // segments — leaving a paused/open stream blocks all future playback.
   function releaseIfPlaying() {
-    if (els.video.currentSrc) stopPlayback();
+    if (els.video.getAttribute('src') || state.playbackUrl) stopPlayback();
   }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) releaseIfPlaying();
@@ -746,13 +859,13 @@
         stopPlayback();
         showScreen(state.returnScreen);
       } else if (code === KEYS.ENTER || code === KEYS.PLAY || code === KEYS.PAUSE) {
-        if (els.video.error && state.playbackUrl) {
-          clearTimeout(state.retryTimer);
+        if (state.playbackUrl && (els.video.error || !els.video.getAttribute('src'))) {
+          // Manual retry after giving up (or while waiting for a slot).
+          closeStream();
           state.retryCount = 0;
           els.playerStatus.textContent = 'Retrying...';
           showOverlay();
-          els.video.src = state.playbackUrl;
-          els.video.play().catch(function () {});
+          openStream(++state.playbackToken);
         } else if (els.video.paused) {
           els.video.play();
         } else {
@@ -775,7 +888,7 @@
       }
       if (els.screens.home.classList.contains('active')) {
         e.preventDefault();
-        stopPreviewVideo();
+        stopPreview();
         showScreen('menu');
         return;
       }

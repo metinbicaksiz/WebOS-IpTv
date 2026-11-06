@@ -89,7 +89,8 @@ input:focus { outline: none; border-color: #3b82f6; }
   padding: 44px 56px 0;
 }
 #menu-title { font-size: 42px; font-weight: bold; }
-#menu-logout-btn {
+#menu-actions { display: flex; gap: 16px; }
+#menu-logout-btn, #menu-refresh-btn {
   font-size: 22px;
   padding: 12px 28px;
   border-radius: 8px;

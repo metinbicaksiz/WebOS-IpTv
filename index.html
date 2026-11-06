@@ -27,7 +27,10 @@
 <section id="screen-menu" class="screen">
   <div id="menu-header">
     <div id="menu-title">IPTV Player</div>
-    <button id="menu-logout-btn" class="focusable">Logout</button>
+    <div id="menu-actions">
+      <button id="menu-refresh-btn" class="focusable">Refresh catalog</button>
+      <button id="menu-logout-btn" class="focusable">Logout</button>
+    </div>
   </div>
   <div id="menu-tiles">
     <div class="menu-tile tile-live focusable" data-target="live" tabindex="0">
@@ -77,7 +80,7 @@
           <div id="player-status"></div>
         </div>
       </div>
-      <div id="preview-empty">Select a channel to preview it here</div>
+      <div id="preview-empty">Select a channel, then press OK to watch</div>
       <div id="preview-info">
         <div id="preview-name"></div>
         <div id="preview-status"></div>
